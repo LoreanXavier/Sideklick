@@ -69,8 +69,10 @@ static class Program {
    Application.EnableVisualStyles();
    bool firstRun=!File.Exists(settingsPath);
    Load();
-   if(firstRun){Save();SetStartup(true);}       // new installs and upgrades start with Windows by default
-   else if(StartupEnabled())SetStartup(true);   // refresh the path in case the exe was moved
+   // Opened straight from a zip, the exe lives in a temp folder that Windows deletes; don't point startup there.
+   bool temporary=Application.ExecutablePath.StartsWith(Path.GetTempPath(),StringComparison.OrdinalIgnoreCase);
+   if(firstRun){Save();if(!temporary)SetStartup(true);}   // new installs and upgrades start with Windows by default
+   else if(StartupEnabled()&&!temporary)SetStartup(true);  // refresh the path in case the exe was moved
 
    LoadIcons();
    BuildTray();
@@ -83,6 +85,8 @@ static class Program {
      timer.Tick+=delegate{Tick();};
      timer.Start();
      if(!quiet)ShowWindow();
+     if(temporary)MessageBox.Show(T("Sideklick is running from a temporary folder (probably straight from the zip), so it can't start with Windows.\n\nExtract Sideklick.exe to a folder you keep (for example Documents) and open it from there.",
+      "Sideklick geçici bir klasörden çalışıyor (muhtemelen doğrudan zip'in içinden), bu yüzden Windows ile başlayamaz.\n\nSideklick.exe'yi kalıcı bir klasöre (ör. Belgeler) çıkar ve oradan aç."),"Sideklick",MessageBoxButtons.OK,MessageBoxIcon.Warning);
      Application.Run();
     }
    } finally {
@@ -114,7 +118,7 @@ static class Program {
     if(!File.Exists(path))continue;
     var lines=File.ReadAllLines(path);
     for(int i=1;i<=3&&i<=lines.Length;i++){int v;if(int.TryParse(lines[i-1].Trim(),out v)&&v>=0&&v<=2)modes[i]=v;}
-    paused=lines.Length>3&&lines[3].Trim()=="1";
+    // The pause flag is not restored: after a restart Sideklick always starts active, so it never looks "forgotten".
     return;
    } catch(IOException){} catch(UnauthorizedAccessException){}
   }
