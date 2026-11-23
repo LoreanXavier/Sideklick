@@ -56,16 +56,21 @@ static class Program {
  [DllImport("user32.dll")] static extern bool UnhookWindowsHookEx(IntPtr h);
  [DllImport("user32.dll")] static extern IntPtr CallNextHookEx(IntPtr h,int n,IntPtr w,IntPtr l);
  [DllImport("kernel32.dll",CharSet=CharSet.Auto)] static extern IntPtr GetModuleHandle(string name);
+ delegate bool EnumWindowsProc(IntPtr h,IntPtr l);
+ [DllImport("user32.dll")] static extern bool EnumWindows(EnumWindowsProc proc,IntPtr l);
+ [DllImport("user32.dll",CharSet=CharSet.Unicode)] static extern int GetWindowText(IntPtr h,System.Text.StringBuilder s,int n);
+ [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr h,out uint pid);
  [DllImport("user32.dll")] static extern void keybd_event(byte key,byte scan,uint flags,UIntPtr extra);
 
  [STAThread] static int Main(string[] args) {
   bool created;
   using(var mutex=new Mutex(true,"Local\\Sideklick",out created))
   using(reopen=new EventWaitHandle(false,EventResetMode.AutoReset,"Local\\Sideklick.Open")) {
+   if(args.Length>1&&args[0]=="/kill"){KillIds(args[1]);return 0;}  // elevated helper, see CloseOlderVersion
    if(!created){
     bool selftestRun=args.Length>0&&args[0]=="/selftest";
     if(selftestRun||!OlderVersionRunning()){reopen.Set();return 0;}
-    if(!ReplaceOlderVersion(mutex))return 0;
+    CloseOlderVersion(mutex);
    }
    // Lets later launches tell this version apart from the original Sideklick, which never creates this event.
    versionMarker=new EventWaitHandle(false,EventResetMode.ManualReset,"Local\\Sideklick.Tray");
@@ -112,34 +117,50 @@ static class Program {
   catch(WaitHandleCannotBeOpenedException){return true;}
   catch{return false;}
  }
- static bool ReplaceOlderVersion(Mutex mutex){
-  Application.EnableVisualStyles();
-  var me=Process.GetCurrentProcess();
-  var old=new List<Process>();
-  foreach(var name in new[]{"Sideklick",Path.GetFileNameWithoutExtension(Application.ExecutablePath)})
-   foreach(var p in Process.GetProcessesByName(name))
-    if(p.Id!=me.Id&&p.SessionId==me.SessionId&&!old.Exists(o=>o.Id==p.Id))old.Add(p);
-  if(old.Count==0){
-   MessageBox.Show(T("An older Sideklick is already running. Open it, click Exit, then open this one again.",
-    "Sideklick'in eski bir sürümü zaten çalışıyor. Onu açıp Çıkış'a bas, sonra bunu tekrar aç."),"Sideklick",MessageBoxButtons.OK,MessageBoxIcon.Information);
-   return false;
+ // The original Sideklick has no tray icon and is hard to find, so close it silently instead of asking.
+ // It is found by process name (also catches renamed downloads like "Sideklick (1).exe") and by its window title.
+ static List<int> FindOlderVersion(){
+  int me=Process.GetCurrentProcess().Id, session=Process.GetCurrentProcess().SessionId;
+  var ids=new List<int>();
+  foreach(var p in Process.GetProcesses()){
+   try{if(p.Id!=me&&p.SessionId==session&&p.ProcessName.IndexOf("sideklick",StringComparison.OrdinalIgnoreCase)>=0&&!ids.Contains(p.Id))ids.Add(p.Id);}catch{}
   }
-  var answer=MessageBox.Show(T("An older version of Sideklick is running.\n\nReplace it with this version? Your button settings carry over.",
-   "Sideklick'in eski bir sürümü çalışıyor.\n\nBu sürümle değiştirilsin mi? Tuş ayarların aynen aktarılır."),"Sideklick",MessageBoxButtons.YesNo,MessageBoxIcon.Question);
-  if(answer!=DialogResult.Yes)return false;
-  foreach(var p in old){
-   // The original keeps settings.txt next to its exe; remember it so Load() can carry the choices over.
-   try{var file=Path.Combine(Path.GetDirectoryName(p.MainModule.FileName),"settings.txt");if(File.Exists(file))legacyPath=file;}catch{}
-   try{p.Kill();p.WaitForExit(3000);}catch{}
-  }
-  try{
-   if(!mutex.WaitOne(3000)){
-    MessageBox.Show(T("Could not close the older Sideklick. Close it yourself, then open this one again.",
-     "Eski Sideklick kapatılamadı. Onu kendin kapat, sonra bunu tekrar aç."),"Sideklick");
-    return false;
+  EnumWindows(delegate(IntPtr h,IntPtr l){
+   var text=new System.Text.StringBuilder(64);GetWindowText(h,text,64);
+   if(text.ToString()=="Sideklick"){uint pid;GetWindowThreadProcessId(h,out pid);if((int)pid!=me&&!ids.Contains((int)pid))ids.Add((int)pid);}
+   return true;
+  },IntPtr.Zero);
+  return ids;
+ }
+ static void CloseOlderVersion(Mutex mutex){
+  var ids=FindOlderVersion();
+  var denied=new List<int>();
+  foreach(var id in ids){
+   try{
+    var p=Process.GetProcessById(id);
+    // The original keeps settings.txt next to its exe; remember it so Load() can carry the choices over.
+    try{var file=Path.Combine(Path.GetDirectoryName(p.MainModule.FileName),"settings.txt");if(File.Exists(file))legacyPath=file;}catch{}
+    p.Kill();p.WaitForExit(3000);
    }
-  } catch(AbandonedMutexException){}  // the old process was killed while holding it; we own it now
-  return true;
+   catch(System.ComponentModel.Win32Exception){denied.Add(id);}  // running as administrator
+   catch{}
+  }
+  if(denied.Count>0){
+   // Only an elevated process can close one that was started "as administrator"; Windows asks once.
+   try{
+    var helper=Process.Start(new ProcessStartInfo(Application.ExecutablePath,"/kill "+string.Join(",",denied.ConvertAll(i=>i.ToString()).ToArray())){Verb="runas",UseShellExecute=true});
+    if(helper!=null)helper.WaitForExit(10000);
+   }catch{}
+  }
+  // Take over the single-instance lock. If the old one somehow survived, start anyway rather than refuse.
+  try{mutex.WaitOne(3000);}catch(AbandonedMutexException){}
+ }
+ static void KillIds(string list){
+  var allowed=FindOlderVersion();  // never kill anything that isn't Sideklick, whatever the arguments say
+  foreach(var part in list.Split(',')){
+   int id;if(!int.TryParse(part,out id)||!allowed.Contains(id))continue;
+   try{var p=Process.GetProcessById(id);p.Kill();p.WaitForExit(3000);}catch{}
+  }
  }
 
  static void Tick(){

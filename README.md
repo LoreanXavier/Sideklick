@@ -48,7 +48,7 @@ Settings are saved in `%APPDATA%\Sideklick\settings.txt`, so they survive restar
 
 Disabling a button applies across Windows. F-key mode maps side buttons to **F13/F14** and wheel click to **F15**; rebind Discord PTT if you choose this mode. Left and right click are never touched.
 
-**Upgrading from the original Sideklick:** just open the new exe. It notices the old one running and offers to replace it, carrying your button settings over.
+**Upgrading from the original Sideklick:** just open the new exe. It closes the old one automatically (even if it was renamed) and carries your button settings over.
 
 ## Build
 
