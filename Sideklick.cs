@@ -1,4 +1,6 @@
 ﻿using System;
+using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Drawing;
 using System.Drawing.Drawing2D;
@@ -22,7 +24,7 @@ static class Program {
  static volatile bool windowActive, rehookRequested;
  static volatile int pressed;
 
- static EventWaitHandle reopen;
+ static EventWaitHandle reopen, versionMarker;
  static Form form;
  static NotifyIcon tray;
  static Icon windowIcon, trayIcon, trayPausedIcon;
@@ -43,7 +45,7 @@ static class Program {
  // Settings live in %APPDATA% so they survive no matter where the exe is kept (Downloads, a zip, a moved folder).
  static readonly string dataDir=Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),"Sideklick");
  static readonly string settingsPath=Path.Combine(dataDir,"settings.txt");
- static readonly string legacyPath=Path.Combine(AppDomain.CurrentDomain.BaseDirectory,"settings.txt");
+ static string legacyPath=Path.Combine(AppDomain.CurrentDomain.BaseDirectory,"settings.txt");
  const string RunKey=@"Software\Microsoft\Windows\CurrentVersion\Run";
 
  static readonly Color Ink=Color.FromArgb(24,35,51), Muted=Color.FromArgb(104,114,130), Line=Color.FromArgb(222,227,235),
@@ -60,7 +62,13 @@ static class Program {
   bool created;
   using(var mutex=new Mutex(true,"Local\\Sideklick",out created))
   using(reopen=new EventWaitHandle(false,EventResetMode.AutoReset,"Local\\Sideklick.Open")) {
-   if(!created){reopen.Set();return 0;}
+   if(!created){
+    bool selftestRun=args.Length>0&&args[0]=="/selftest";
+    if(selftestRun||!OlderVersionRunning()){reopen.Set();return 0;}
+    if(!ReplaceOlderVersion(mutex))return 0;
+   }
+   // Lets later launches tell this version apart from the original Sideklick, which never creates this event.
+   versionMarker=new EventWaitHandle(false,EventResetMode.ManualReset,"Local\\Sideklick.Tray");
    hook=SetWindowsHookEx(14,callback,GetModuleHandle(null),0);
    if(hook==IntPtr.Zero){MessageBox.Show("Could not start mouse hook: "+Marshal.GetLastWin32Error(),"Sideklick");return 1;}
    if(args.Length>0&&args[0]=="/selftest"){UnhookWindowsHookEx(hook);return 0;}
@@ -96,6 +104,42 @@ static class Program {
     tray.Visible=false;tray.Dispose();
    }
   } return 0;
+ }
+
+ // ---------- replacing the original Sideklick ----------
+ static bool OlderVersionRunning(){
+  try{using(EventWaitHandle.OpenExisting("Local\\Sideklick.Tray")){}return false;}
+  catch(WaitHandleCannotBeOpenedException){return true;}
+  catch{return false;}
+ }
+ static bool ReplaceOlderVersion(Mutex mutex){
+  Application.EnableVisualStyles();
+  var me=Process.GetCurrentProcess();
+  var old=new List<Process>();
+  foreach(var name in new[]{"Sideklick",Path.GetFileNameWithoutExtension(Application.ExecutablePath)})
+   foreach(var p in Process.GetProcessesByName(name))
+    if(p.Id!=me.Id&&p.SessionId==me.SessionId&&!old.Exists(o=>o.Id==p.Id))old.Add(p);
+  if(old.Count==0){
+   MessageBox.Show(T("An older Sideklick is already running. Open it, click Exit, then open this one again.",
+    "Sideklick'in eski bir sürümü zaten çalışıyor. Onu açıp Çıkış'a bas, sonra bunu tekrar aç."),"Sideklick",MessageBoxButtons.OK,MessageBoxIcon.Information);
+   return false;
+  }
+  var answer=MessageBox.Show(T("An older version of Sideklick is running.\n\nReplace it with this version? Your button settings carry over.",
+   "Sideklick'in eski bir sürümü çalışıyor.\n\nBu sürümle değiştirilsin mi? Tuş ayarların aynen aktarılır."),"Sideklick",MessageBoxButtons.YesNo,MessageBoxIcon.Question);
+  if(answer!=DialogResult.Yes)return false;
+  foreach(var p in old){
+   // The original keeps settings.txt next to its exe; remember it so Load() can carry the choices over.
+   try{var file=Path.Combine(Path.GetDirectoryName(p.MainModule.FileName),"settings.txt");if(File.Exists(file))legacyPath=file;}catch{}
+   try{p.Kill();p.WaitForExit(3000);}catch{}
+  }
+  try{
+   if(!mutex.WaitOne(3000)){
+    MessageBox.Show(T("Could not close the older Sideklick. Close it yourself, then open this one again.",
+     "Eski Sideklick kapatılamadı. Onu kendin kapat, sonra bunu tekrar aç."),"Sideklick");
+    return false;
+   }
+  } catch(AbandonedMutexException){}  // the old process was killed while holding it; we own it now
+  return true;
  }
 
  static void Tick(){
