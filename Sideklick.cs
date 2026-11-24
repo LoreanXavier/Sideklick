@@ -19,10 +19,17 @@ static class Program {
  // Button slots: 1 = side button 1 (Mouse 4), 2 = side button 2 (Mouse 5), 3 = wheel click.
  // Modes: 0 = normal, 1 = disabled, 2 = send F13/F14/F15.
  static int[] modes=new int[4];
- static bool paused;
+ static volatile bool paused;
  static bool[] held=new bool[4], swallowed=new bool[4];
- static volatile bool windowActive, rehookRequested;
+ static volatile bool windowActive;
  static volatile int pressed;
+
+ // The hook lives on its own thread so nothing the window does can make Windows time it out and drop it.
+ static uint hookThreadId;
+ static volatile int lastHookTick, lastMoveTick, lastRehookTick;
+ static Point lastCursor;
+ static readonly object keyLock=new object();
+ const uint WM_QUIT=0x12, WM_REHOOK=0x8001;
 
  static EventWaitHandle reopen, versionMarker;
  static Form form;
@@ -61,6 +68,12 @@ static class Program {
  [DllImport("user32.dll",CharSet=CharSet.Unicode)] static extern int GetWindowText(IntPtr h,System.Text.StringBuilder s,int n);
  [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr h,out uint pid);
  [DllImport("user32.dll")] static extern void keybd_event(byte key,byte scan,uint flags,UIntPtr extra);
+ [DllImport("user32.dll",CharSet=CharSet.Unicode)] static extern int GetClassName(IntPtr h,System.Text.StringBuilder s,int n);
+ [StructLayout(LayoutKind.Sequential)] struct MSG {public IntPtr hwnd; public uint message; public IntPtr wParam,lParam; public uint time; public int x,y;}
+ [DllImport("user32.dll")] static extern int GetMessage(out MSG msg,IntPtr hwnd,uint min,uint max);
+ [DllImport("user32.dll")] static extern bool PostThreadMessage(uint thread,uint msg,IntPtr w,IntPtr l);
+ [DllImport("kernel32.dll")] static extern uint GetCurrentThreadId();
+ [DllImport("user32.dll")] static extern bool GetCursorPos(out Point p);
 
  [STAThread] static int Main(string[] args) {
   bool created;
@@ -74,9 +87,13 @@ static class Program {
    }
    // Lets later launches tell this version apart from the original Sideklick, which never creates this event.
    versionMarker=new EventWaitHandle(false,EventResetMode.ManualReset,"Local\\Sideklick.Tray");
-   hook=SetWindowsHookEx(14,callback,GetModuleHandle(null),0);
-   if(hook==IntPtr.Zero){MessageBox.Show("Could not start mouse hook: "+Marshal.GetLastWin32Error(),"Sideklick");return 1;}
-   if(args.Length>0&&args[0]=="/selftest"){UnhookWindowsHookEx(hook);return 0;}
+   if(args.Length>0&&args[0]=="/selftest"){
+    var test=SetWindowsHookEx(14,callback,GetModuleHandle(null),0);
+    if(test==IntPtr.Zero)return 1;
+    UnhookWindowsHookEx(test);return 0;
+   }
+   int error=StartHookThread();
+   if(error!=0){MessageBox.Show("Could not start mouse hook: "+error,"Sideklick");return 1;}
    bool quiet=args.Length>0&&args[0]=="--quiet";
 
    Application.EnableVisualStyles();
@@ -89,8 +106,8 @@ static class Program {
 
    LoadIcons();
    BuildTray();
-   PowerModeChangedEventHandler power=delegate(object s,PowerModeChangedEventArgs e){if(e.Mode==PowerModes.Resume)rehookRequested=true;};
-   SessionSwitchEventHandler session=delegate(object s,SessionSwitchEventArgs e){if(e.Reason==SessionSwitchReason.SessionUnlock)rehookRequested=true;};
+   PowerModeChangedEventHandler power=delegate(object s,PowerModeChangedEventArgs e){if(e.Mode==PowerModes.Resume)Rehook();};
+   SessionSwitchEventHandler session=delegate(object s,SessionSwitchEventArgs e){if(e.Reason==SessionSwitchReason.SessionUnlock)Rehook();};
    SystemEvents.PowerModeChanged+=power;
    SystemEvents.SessionSwitch+=session;
    try {
@@ -105,7 +122,7 @@ static class Program {
    } finally {
     SystemEvents.PowerModeChanged-=power;
     SystemEvents.SessionSwitch-=session;
-    UnhookWindowsHookEx(hook);Release();
+    PostThreadMessage(hookThreadId,WM_QUIT,IntPtr.Zero,IntPtr.Zero);Release();
     tray.Visible=false;tray.Dispose();
    }
   } return 0;
@@ -127,7 +144,9 @@ static class Program {
   }
   EnumWindows(delegate(IntPtr h,IntPtr l){
    var text=new System.Text.StringBuilder(64);GetWindowText(h,text,64);
-   if(text.ToString()=="Sideklick"){uint pid;GetWindowThreadProcessId(h,out pid);if((int)pid!=me&&!ids.Contains((int)pid))ids.Add((int)pid);}
+   var cls=new System.Text.StringBuilder(64);GetClassName(h,cls,64);
+   // Only WinForms windows: a folder or browser tab named "Sideklick" must never be closed.
+   if(text.ToString()=="Sideklick"&&cls.ToString().StartsWith("WindowsForms10")){uint pid;GetWindowThreadProcessId(h,out pid);if((int)pid!=me&&!ids.Contains((int)pid))ids.Add((int)pid);}
    return true;
   },IntPtr.Zero);
   return ids;
@@ -163,14 +182,43 @@ static class Program {
   }
  }
 
+ // ---------- hook thread ----------
+ static int StartHookThread(){
+  int error=0;
+  var ready=new ManualResetEvent(false);
+  var thread=new Thread(delegate(){
+   hookThreadId=GetCurrentThreadId();
+   // Compile the callback up front so its first call can't be slow enough to get the hook dropped.
+   System.Runtime.CompilerServices.RuntimeHelpers.PrepareDelegate(callback);
+   System.Runtime.CompilerServices.RuntimeHelpers.PrepareMethod(typeof(Program).GetMethod("Mouse",System.Reflection.BindingFlags.NonPublic|System.Reflection.BindingFlags.Static).MethodHandle);
+   hook=SetWindowsHookEx(14,callback,GetModuleHandle(null),0);
+   if(hook==IntPtr.Zero)error=Marshal.GetLastWin32Error();
+   lastHookTick=lastRehookTick=Environment.TickCount;
+   ready.Set();
+   if(hook==IntPtr.Zero)return;
+   MSG msg;
+   while(GetMessage(out msg,IntPtr.Zero,0,0)>0){
+    if(msg.message==WM_REHOOK){
+     var fresh=SetWindowsHookEx(14,callback,GetModuleHandle(null),0);
+     if(fresh!=IntPtr.Zero){var old=hook;hook=fresh;UnhookWindowsHookEx(old);}
+    }
+   }
+   UnhookWindowsHookEx(hook);
+  });
+  thread.IsBackground=true;thread.Priority=ThreadPriority.Highest;thread.Name="Sideklick hook";
+  thread.Start();ready.WaitOne();
+  return error;
+ }
+ static void Rehook(){lastRehookTick=Environment.TickCount;PostThreadMessage(hookThreadId,WM_REHOOK,IntPtr.Zero,IntPtr.Zero);}
+
  static void Tick(){
   if(reopen.WaitOne(0))ShowWindow();
-  if(rehookRequested){
-   // Windows can silently drop low-level hooks after sleep; reinstall to be safe.
-   rehookRequested=false;
-   var fresh=SetWindowsHookEx(14,callback,GetModuleHandle(null),0);
-   if(fresh!=IntPtr.Zero){UnhookWindowsHookEx(hook);hook=fresh;}
-  }
+  // Watchdog: Windows silently removes a hook that ever answers too slowly (busy sign-in, sleep, a hiccup).
+  // If the cursor moved but the hook heard nothing for a second, it is gone, so install it again.
+  Point cursor;
+  int now=Environment.TickCount;
+  if(GetCursorPos(out cursor)&&cursor!=lastCursor){lastCursor=cursor;lastMoveTick=now;}
+  if(lastMoveTick-lastHookTick>1000&&now-lastMoveTick<1000&&now-lastRehookTick>2000)Rehook();
   int p=pressed;
   if(p!=0){pressed=0;flashUntil[p]=DateTime.Now.AddMilliseconds(1200);if(rows[p]!=null)rows[p].Invalidate();}
   for(int b=1;b<=3;b++)if(flashUntil[b]!=DateTime.MinValue&&DateTime.Now>flashUntil[b]){flashUntil[b]=DateTime.MinValue;if(rows[b]!=null)rows[b].Invalidate();}
@@ -388,9 +436,10 @@ static class Program {
  }
 
  // ---------- mouse hook ----------
- // Runs on the UI thread; keep it fast and only touch flags/arrays.
+ // Runs on the hook thread; keep it fast and only touch flags/arrays.
  static IntPtr Mouse(int n,IntPtr w,IntPtr l){
   if(n>=0){
+   lastHookTick=Environment.TickCount;
    int msg=w.ToInt32(),b=0;bool down=msg==0x20B||msg==0x207;
    if(msg==0x20B||msg==0x20C){var d=(Data)Marshal.PtrToStructure(l,typeof(Data));int side=(int)(d.mouseData>>16);if(side==1||side==2)b=side;}
    else if(msg==0x207||msg==0x208)b=3;
@@ -398,18 +447,18 @@ static class Program {
     if(down){
      if(windowActive){pressed=b;swallowed[b]=true;return new IntPtr(1);}
      if(paused||modes[b]==0)return CallNextHookEx(hook,n,w,l);
-     if(modes[b]==2&&!held[b]){keybd_event((byte)(0x7B+b),0,0,UIntPtr.Zero);held[b]=true;}
+     if(modes[b]==2)lock(keyLock)if(!held[b]){keybd_event((byte)(0x7B+b),0,0,UIntPtr.Zero);held[b]=true;}
      swallowed[b]=true;return new IntPtr(1);
     }
     // Always swallow the release of a press we swallowed, even if the mode changed in between.
     if(swallowed[b]){
      swallowed[b]=false;
-     if(held[b]){keybd_event((byte)(0x7B+b),0,2,UIntPtr.Zero);held[b]=false;}
+     lock(keyLock)if(held[b]){keybd_event((byte)(0x7B+b),0,2,UIntPtr.Zero);held[b]=false;}
      return new IntPtr(1);
     }
    }
   }
   return CallNextHookEx(hook,n,w,l);
  }
- static void Release(){for(int i=1;i<=3;i++)if(held[i]){keybd_event((byte)(0x7B+i),0,2,UIntPtr.Zero);held[i]=false;}}
+ static void Release(){lock(keyLock)for(int i=1;i<=3;i++)if(held[i]){keybd_event((byte)(0x7B+i),0,2,UIntPtr.Zero);held[i]=false;}}
 }
