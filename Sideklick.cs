@@ -15,6 +15,16 @@ static class Program {
  delegate IntPtr HookProc(int n, IntPtr w, IntPtr l);
  static HookProc callback=Mouse;
  static IntPtr hook;
+ // Some mouse software turns the side buttons into the keyboard's Browser Back/Forward keys instead of
+ // mouse buttons, so those keys are caught by a keyboard hook and treated like side button 1/2.
+ static HookProc kbCallback=Keyboard;
+ static IntPtr kbHook;
+ static bool[] kbSwallowed=new bool[4];
+ const int VK_BROWSER_BACK=0xA6, VK_BROWSER_FORWARD=0xA7;
+ static volatile string lastSeen;
+ static string shownSeen;
+ static Label seenLabel;
+ [StructLayout(LayoutKind.Sequential)] struct KeyData {public uint vk,scan,flags,time; public UIntPtr extra;}
 
  // Button slots: 1 = side button 1 (Mouse 4), 2 = side button 2 (Mouse 5), 3 = wheel click.
  // Modes: 0 = normal, 1 = disabled, 2 = send F13/F14/F15.
@@ -191,8 +201,11 @@ static class Program {
    // Compile the callback up front so its first call can't be slow enough to get the hook dropped.
    System.Runtime.CompilerServices.RuntimeHelpers.PrepareDelegate(callback);
    System.Runtime.CompilerServices.RuntimeHelpers.PrepareMethod(typeof(Program).GetMethod("Mouse",System.Reflection.BindingFlags.NonPublic|System.Reflection.BindingFlags.Static).MethodHandle);
+   System.Runtime.CompilerServices.RuntimeHelpers.PrepareDelegate(kbCallback);
+   System.Runtime.CompilerServices.RuntimeHelpers.PrepareMethod(typeof(Program).GetMethod("Keyboard",System.Reflection.BindingFlags.NonPublic|System.Reflection.BindingFlags.Static).MethodHandle);
    hook=SetWindowsHookEx(14,callback,GetModuleHandle(null),0);
    if(hook==IntPtr.Zero)error=Marshal.GetLastWin32Error();
+   kbHook=SetWindowsHookEx(13,kbCallback,GetModuleHandle(null),0);
    lastHookTick=lastRehookTick=Environment.TickCount;
    ready.Set();
    if(hook==IntPtr.Zero)return;
@@ -201,9 +214,12 @@ static class Program {
     if(msg.message==WM_REHOOK){
      var fresh=SetWindowsHookEx(14,callback,GetModuleHandle(null),0);
      if(fresh!=IntPtr.Zero){var old=hook;hook=fresh;UnhookWindowsHookEx(old);}
+     var freshKb=SetWindowsHookEx(13,kbCallback,GetModuleHandle(null),0);
+     if(freshKb!=IntPtr.Zero){var old=kbHook;kbHook=freshKb;if(old!=IntPtr.Zero)UnhookWindowsHookEx(old);}
     }
    }
    UnhookWindowsHookEx(hook);
+   if(kbHook!=IntPtr.Zero)UnhookWindowsHookEx(kbHook);
   });
   thread.IsBackground=true;thread.Priority=ThreadPriority.Highest;thread.Name="Sideklick hook";
   thread.Start();ready.WaitOne();
@@ -222,6 +238,8 @@ static class Program {
   int p=pressed;
   if(p!=0){pressed=0;flashUntil[p]=DateTime.Now.AddMilliseconds(1200);if(rows[p]!=null)rows[p].Invalidate();}
   for(int b=1;b<=3;b++)if(flashUntil[b]!=DateTime.MinValue&&DateTime.Now>flashUntil[b]){flashUntil[b]=DateTime.MinValue;if(rows[b]!=null)rows[b].Invalidate();}
+  var seen=lastSeen;
+  if(seen!=shownSeen&&seenLabel!=null&&!seenLabel.IsDisposed){shownSeen=seen;seenLabel.Text=T("Last detected: ","Son algılanan: ")+seen;}
  }
 
  // ---------- settings ----------
@@ -377,9 +395,12 @@ static class Program {
   var intro=new Label{Text=T("Choose what each button does. Changes apply and save instantly.\nPress a mouse button while this window is open to find its row.",
    "Her tuşun ne yapacağını seç. Değişiklikler anında uygulanır ve kaydedilir.\nPencere açıkken bir fare tuşuna basarsan satırı yanıp söner."),
    Left=pad,Top=84,Width=W-2*pad,Height=42,ForeColor=Muted,Font=new Font("Segoe UI",9.5f)};
-  form.Controls.AddRange(new Control[]{logo,title,statusLabel,pauseButton,intro});
+  shownSeen=lastSeen;
+  seenLabel=new Label{Text=T("Last detected: ","Son algılanan: ")+(lastSeen??T("press a side button","bir yan tuşa bas")),
+   Left=pad,Top=128,Width=W-2*pad,Height=20,ForeColor=Accent,Font=new Font("Segoe UI Semibold",9.5f)};
+  form.Controls.AddRange(new Control[]{logo,title,statusLabel,pauseButton,intro,seenLabel});
 
-  int y=138;
+  int y=158;
   for(int b=1;b<=3;b++){
    int bb=b;
    var row=new Panel{Left=pad,Top=y,Width=W-2*pad,Height=72,BackColor=Color.White};
@@ -445,7 +466,7 @@ static class Program {
    else if(msg==0x207||msg==0x208)b=3;
    if(b>0){
     if(down){
-     if(windowActive){pressed=b;swallowed[b]=true;return new IntPtr(1);}
+     if(windowActive){pressed=b;swallowed[b]=true;Seen(T("mouse button: ","fare tuşu: ")+Name(b),false);return new IntPtr(1);}
      if(paused||modes[b]==0)return CallNextHookEx(hook,n,w,l);
      if(modes[b]==2)lock(keyLock)if(!held[b]){keybd_event((byte)(0x7B+b),0,0,UIntPtr.Zero);held[b]=true;}
      swallowed[b]=true;return new IntPtr(1);
@@ -459,6 +480,42 @@ static class Program {
    }
   }
   return CallNextHookEx(hook,n,w,l);
+ }
+ static IntPtr Keyboard(int n,IntPtr w,IntPtr l){
+  if(n>=0){
+   var k=(KeyData)Marshal.PtrToStructure(l,typeof(KeyData));
+   int msg=w.ToInt32();bool down=msg==0x100||msg==0x104, up=msg==0x101||msg==0x105;
+   int b=k.vk==VK_BROWSER_BACK?1:k.vk==VK_BROWSER_FORWARD?2:0;
+   if(down&&windowActive)Seen(T("keyboard key: ","klavye tuşu: ")+KeyName(k.vk),true);
+   if(b>0){
+    if(down){
+     if(windowActive){pressed=b;kbSwallowed[b]=true;return new IntPtr(1);}
+     if(!paused&&modes[b]!=0){
+      if(modes[b]==2)lock(keyLock)if(!held[b]){keybd_event((byte)(0x7B+b),0,0,UIntPtr.Zero);held[b]=true;}
+      kbSwallowed[b]=true;return new IntPtr(1);
+     }
+    }
+    else if(up&&kbSwallowed[b]){
+     kbSwallowed[b]=false;
+     lock(keyLock)if(held[b]){keybd_event((byte)(0x7B+b),0,2,UIntPtr.Zero);held[b]=false;}
+     return new IntPtr(1);
+    }
+   }
+  }
+  return CallNextHookEx(kbHook,n,w,l);
+ }
+ static string KeyName(uint vk){
+  if(vk==VK_BROWSER_BACK)return T("Browser Back","Tarayıcı Geri");
+  if(vk==VK_BROWSER_FORWARD)return T("Browser Forward","Tarayıcı İleri");
+  return ((Keys)vk).ToString();
+ }
+ // Shows what actually arrives when a button is pressed with the window open; key combos within 0.4 s are joined.
+ static int lastSeenTick;
+ static void Seen(string what,bool keyboard){
+  int now=Environment.TickCount;
+  var prev=lastSeen;
+  lastSeen=(keyboard&&prev!=null&&now-lastSeenTick<400)?prev+" + "+what:what;
+  lastSeenTick=now;
  }
  static void Release(){lock(keyLock)for(int i=1;i<=3;i++)if(held[i]){keybd_event((byte)(0x7B+i),0,2,UIntPtr.Zero);held[i]=false;}}
 }
